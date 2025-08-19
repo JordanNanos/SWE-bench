@@ -42,6 +42,7 @@ MODEL_LIMITS = {
     "gpt-4-0613": 8_192,
     "gpt-4-1106-preview": 128_000,
     "gpt-4-0125-preview": 128_000,
+    "gpt-5-nano-2025-08-07": 128_000,
 }
 
 # The cost per token for each model input.
@@ -61,6 +62,7 @@ MODEL_COST_PER_INPUT = {
     "gpt-4-32k": 0.00006,
     "gpt-4-1106-preview": 0.00001,
     "gpt-4-0125-preview": 0.00001,
+    "gpt-5-nano-2025-08-07": 0.000005,
 }
 
 # The cost per token for each model output.
@@ -80,6 +82,7 @@ MODEL_COST_PER_OUTPUT = {
     "gpt-4-32k": 0.00012,
     "gpt-4-1106-preview": 0.00003,
     "gpt-4-0125-preview": 0.00003,
+    "gpt-5-nano-2025-08-07": 0.000015,
 }
 
 # used for azure
@@ -126,28 +129,26 @@ def call_chat(model_name_or_path, inputs, use_azure, temperature, top_p, **model
     system_messages = inputs.split("\n", 1)[0]
     user_message = inputs.split("\n", 1)[1]
     try:
+        # Prepare API parameters, conditionally including top_p
+        api_params = {
+            "messages": [
+                {"role": "system", "content": system_messages},
+                {"role": "user", "content": user_message},
+            ],
+            "temperature": temperature,
+            **model_args,
+        }
+        
+        # Only include top_p if it's not None (some models don't support it)
+        if top_p is not None:
+            api_params["top_p"] = top_p
+            
         if use_azure:
-            response = openai.chat.completions.create(
-                engine=ENGINES[model_name_or_path] if use_azure else None,
-                messages=[
-                    {"role": "system", "content": system_messages},
-                    {"role": "user", "content": user_message},
-                ],
-                temperature=temperature,
-                top_p=top_p,
-                **model_args,
-            )
+            api_params["engine"] = ENGINES[model_name_or_path] if use_azure else None
+            response = openai.chat.completions.create(**api_params)
         else:
-            response = openai.chat.completions.create(
-                model=model_name_or_path,
-                messages=[
-                    {"role": "system", "content": system_messages},
-                    {"role": "user", "content": user_message},
-                ],
-                temperature=temperature,
-                top_p=top_p,
-                **model_args,
-            )
+            api_params["model"] = model_name_or_path
+            response = openai.chat.completions.create(**api_params)
         input_tokens = response.usage.prompt_tokens
         output_tokens = response.usage.completion_tokens
         cost = calc_cost(response.model, input_tokens, output_tokens)
@@ -208,9 +209,19 @@ def openai_inference(
         openai.api_type = "azure"
         openai.api_base = "https://pnlpopenai3.openai.azure.com/"
         openai.api_version = "2023-05-15"
-    temperature = model_args.pop("temperature", 0.2)
-    top_p = model_args.pop("top_p", 0.95 if temperature > 0 else 1)
-    print(f"Using temperature={temperature}, top_p={top_p}")
+    # gpt-5-nano models only support default temperature of 1 and no top_p
+    if "gpt-5-nano" in model_name_or_path:
+        temperature = model_args.pop("temperature", 1.0)
+        top_p = None  # gpt-5-nano doesn't support top_p
+        model_args.pop("top_p", None)  # Remove top_p if it was passed
+    else:
+        temperature = model_args.pop("temperature", 0.2)
+        top_p = model_args.pop("top_p", 0.95 if temperature > 0 else 1)
+    
+    if top_p is not None:
+        print(f"Using temperature={temperature}, top_p={top_p}")
+    else:
+        print(f"Using temperature={temperature} (top_p not supported by this model)")
     basic_args = {
         "model_name_or_path": model_name_or_path,
     }
@@ -352,9 +363,19 @@ def anthropic_inference(
         desc="Filtering",
         load_from_cache_file=False,
     )
-    temperature = model_args.pop("temperature", 0.2)
-    top_p = model_args.pop("top_p", 0.95 if temperature > 0 else 1)
-    print(f"Using temperature={temperature}, top_p={top_p}")
+    # gpt-5-nano models only support default temperature of 1 and no top_p (this shouldn't affect Anthropic but keeping consistent)
+    if "gpt-5-nano" in model_name_or_path:
+        temperature = model_args.pop("temperature", 1.0)
+        top_p = None  # gpt-5-nano doesn't support top_p
+        model_args.pop("top_p", None)  # Remove top_p if it was passed
+    else:
+        temperature = model_args.pop("temperature", 0.2)
+        top_p = model_args.pop("top_p", 0.95 if temperature > 0 else 1)
+    
+    if top_p is not None:
+        print(f"Using temperature={temperature}, top_p={top_p}")
+    else:
+        print(f"Using temperature={temperature} (top_p not supported by this model)")
     basic_args = {
         "model_name_or_path": model_name_or_path,
     }
@@ -465,6 +486,10 @@ def main(
     if shard_id is not None and num_shards is not None:
         output_file += f"__shard-{shard_id}__num_shards-{num_shards}"
     output_file = Path(output_dir, output_file + ".jsonl")
+    
+    # Create output directory if it doesn't exist
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    
     logger.info(f"Will write to {output_file}")
     existing_ids = set()
     if os.path.exists(output_file):
